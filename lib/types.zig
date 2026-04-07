@@ -219,3 +219,38 @@ pub fn isEnum(ty: Type) bool {
 pub fn isTaggedUnion(ty: Type) bool {
     return c.cirTypeIsTaggedUnion(ty.raw);
 }
+
+// ===----------------------------------------------------------------------===
+// Type introspection — widths, element types, function type queries
+// ===----------------------------------------------------------------------===
+
+pub fn isInteger(ty: Type) bool {
+    return c.mlirTypeIsAInteger(ty.raw);
+}
+pub fn isFloat(ty: Type) bool {
+    return c.mlirTypeIsAFloat(ty.raw);
+}
+pub fn isFunction(ty: Type) bool {
+    return c.mlirTypeIsAFunction(ty.raw);
+}
+pub fn integerWidth(ty: Type) u32 {
+    return c.mlirIntegerTypeGetWidth(ty.raw);
+}
+pub fn floatWidth(ty: Type) u32 {
+    return c.mlirFloatTypeGetWidth(ty.raw);
+}
+pub fn functionNumInputs(ty: Type) usize {
+    return @intCast(c.mlirFunctionTypeGetNumInputs(ty.raw));
+}
+pub fn functionInput(ty: Type, index: usize) Type {
+    return .{ .raw = c.mlirFunctionTypeGetInput(ty.raw, @intCast(index)) };
+}
+pub fn functionNumResults(ty: Type) usize {
+    return @intCast(c.mlirFunctionTypeGetNumResults(ty.raw));
+}
+pub fn functionResult(ty: Type, index: usize) Type {
+    return .{ .raw = c.mlirFunctionTypeGetResult(ty.raw, @intCast(index)) };
+}
+pub fn typeEqual(a: Type, b: Type) bool {
+    return c.mlirTypeEqual(a.raw, b.raw);
+}

@@ -53,9 +53,26 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(example);
 
+    // --- Sema test (Zig-written SemanticAnalysis) ---
+    const sema_mod = b.createModule(.{
+        .root_source_file = b.path("test/sema_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sema_mod.addImport("cot", cot_mod);
+    linkCotLibraries(b, sema_mod, cot_dev_build, core_build, llvm_dir);
+
+    const sema_exe = b.addExecutable(.{
+        .name = "cot-zig-sema-test",
+        .root_module = sema_mod,
+    });
+    b.installArtifact(sema_exe);
+
     const run_example = b.addRunArtifact(example);
+    const run_sema = b.addRunArtifact(sema_exe);
     const test_step = b.step("test", "Run binding tests");
     test_step.dependOn(&run_example.step);
+    test_step.dependOn(&run_sema.step);
 }
 
 fn linkCotLibraries(

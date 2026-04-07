@@ -16,6 +16,7 @@ pub const ops = @import("ops.zig");
 pub const ir = @import("ir.zig");
 pub const transform = @import("transform.zig");
 pub const pipeline = @import("pipeline.zig");
+pub const sema = @import("sema.zig");
 
 // Re-export core handle types at the top level for convenience.
 pub const Context = ir.Context;

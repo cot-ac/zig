@@ -71,6 +71,10 @@ pub const Block = struct {
         c.mlirBlockAppendOwnedOperation(self.raw, op.raw);
     }
 
+    pub fn insertOwnedOperationBefore(self: Block, ref: Operation, op: Operation) void {
+        c.mlirBlockInsertOwnedOperationBefore(self.raw, ref.raw, op.raw);
+    }
+
     pub fn firstOperation(self: Block) ?Operation {
         const op = c.mlirBlockGetFirstOperation(self.raw);
         return if (c.mlirOperationIsNull(op)) null else .{ .raw = op };
@@ -171,10 +175,31 @@ pub const Operation = struct {
         return .{ .raw = c.mlirOperationGetRegion(self.raw, @intCast(index)) };
     }
 
+    pub fn setOperand(self: Operation, index: usize, value: Value) void {
+        c.mlirOperationSetOperand(self.raw, @intCast(index), value.raw);
+    }
+
+    pub fn getParentOperation(self: Operation) ?Operation {
+        const parent = c.mlirOperationGetParentOperation(self.raw);
+        return if (c.mlirOperationIsNull(parent)) null else .{ .raw = parent };
+    }
+
+    /// Get an attribute by name, returning the function type if it's a TypeAttr.
+    pub fn getFunctionType(self: Operation) ?Type {
+        const attr = c.mlirOperationGetAttributeByName(
+            self.raw,
+            c.mlirStringRefCreateFromCString("function_type"),
+        );
+        if (c.mlirAttributeIsNull(attr)) return null;
+        // TypeAttr wraps a Type.
+        if (!c.mlirAttributeIsAType(attr)) return null;
+        return .{ .raw = c.mlirTypeAttrGetValue(attr) };
+    }
+
     /// Walk all operations in post-order.
     pub fn walk(self: Operation, comptime callback: fn (Operation) WalkResult) void {
         const Wrapper = struct {
-            fn cb(op: c.MlirOperation, _: ?*anyopaque) callconv(.C) c.MlirWalkResult {
+            fn cb(op: c.MlirOperation, _: ?*anyopaque) callconv(.c) c.MlirWalkResult {
                 return switch (callback(.{ .raw = op })) {
                     .advance => c.MlirWalkResultAdvance,
                     .interrupt => c.MlirWalkResultInterrupt,
@@ -190,6 +215,28 @@ pub const WalkResult = enum {
     advance,
     interrupt,
     skip,
+};
+
+// ===----------------------------------------------------------------------===
+// SymbolTable — for looking up func.func by callee name.
+// ===----------------------------------------------------------------------===
+
+pub const SymbolTable = struct {
+    raw: c.MlirSymbolTable,
+
+    pub fn create(module_op: Operation) SymbolTable {
+        return .{ .raw = c.mlirSymbolTableCreate(module_op.raw) };
+    }
+
+    pub fn destroy(self: SymbolTable) void {
+        c.mlirSymbolTableDestroy(self.raw);
+    }
+
+    pub fn lookup(self: SymbolTable, name: []const u8) ?Operation {
+        const ref = c.MlirStringRef{ .data = name.ptr, .length = name.len };
+        const op = c.mlirSymbolTableLookup(self.raw, ref);
+        return if (c.mlirOperationIsNull(op)) null else .{ .raw = op };
+    }
 };
 
 // ===----------------------------------------------------------------------===

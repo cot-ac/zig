@@ -11,7 +11,7 @@ pub fn createModulePass(
     comptime run: fn (Operation) void,
 ) Pass {
     const Wrapper = struct {
-        fn cb(op: c.MlirOperation, _: ?*anyopaque) callconv(.C) void {
+        fn cb(op: c.MlirOperation, _: ?*anyopaque) callconv(.c) void {
             run(.{ .raw = op });
         }
     };
@@ -25,7 +25,7 @@ pub fn createFuncPass(
     comptime run: fn (Operation) void,
 ) Pass {
     const Wrapper = struct {
-        fn cb(op: c.MlirOperation, _: ?*anyopaque) callconv(.C) void {
+        fn cb(op: c.MlirOperation, _: ?*anyopaque) callconv(.c) void {
             run(.{ .raw = op });
         }
     };

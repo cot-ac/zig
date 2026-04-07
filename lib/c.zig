@@ -9,4 +9,5 @@ pub const cir = @cImport({
     @cInclude("mlir-c/BuiltinAttributes.h");
     @cInclude("mlir-c/Pass.h");
     @cInclude("mlir-c/Support.h");
+    @cInclude("stdlib.h");
 });
