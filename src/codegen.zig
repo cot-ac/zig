@@ -19,6 +19,7 @@ const Location = cot.Location;
 const VarInfo = struct {
     addr: Value, // alloca pointer
     ty: Type, // stored type
+    pointee_ty: ?Type = null, // for pointer variables: what the pointer points to
 };
 
 pub const Codegen = struct {
@@ -191,7 +192,13 @@ pub const Codegen = struct {
             const arg = entry_block.getArgument(i);
             const addr = cot.memory.alloca(self.current_block, self.loc, param_types[i]);
             cot.memory.store(self.current_block, self.loc, arg, addr);
-            try self.vars.put(p.name, .{ .addr = addr, .ty = param_types[i] });
+            // Track pointee type for pointer params
+            const pointee: ?Type = if (p.type_ref.is_pointer) blk: {
+                var inner = p.type_ref;
+                inner.is_pointer = false;
+                break :blk self.resolveType(inner);
+            } else null;
+            try self.vars.put(p.name, .{ .addr = addr, .ty = param_types[i], .pointee_ty = pointee });
         }
 
         // Emit body
@@ -206,9 +213,29 @@ pub const Codegen = struct {
     }
 
     fn emitTestBlock(self: *Codegen, td: parser.TestDecl) CodegenError!void {
-        // Emit test as a standalone test_case op
-        _ = cot.testing.testCase(self.module_body, self.loc, @ptrCast(td.name.ptr));
-        // TODO: populate test_case body region with td.body statements
+        // Emit test_case "name" { body }
+        const test_op = cot.testing.testCase(self.module_body, self.loc, self.zstr(td.name));
+        // Populate the body region
+        const body_region = test_op.getRegion(0);
+        const body_block = Block.create(0, null, null);
+        body_region.appendOwnedBlock(body_block);
+
+        // Save and reset codegen state for test isolation
+        const saved_block = self.current_block;
+        const saved_terminated = self.block_terminated;
+        const saved_vars = self.vars;
+        self.current_block = body_block;
+        self.block_terminated = false;
+        self.vars = std.StringHashMap(VarInfo).init(self.alloc);
+
+        for (td.body.items) |stmt| {
+            try self.emitStmt(stmt);
+        }
+
+        // Restore state (test_case has NoTerminator — no terminator needed)
+        self.current_block = saved_block;
+        self.block_terminated = saved_terminated;
+        self.vars = saved_vars;
     }
 
     // ===----------------------------------------------------------------------===
@@ -663,7 +690,11 @@ pub const Codegen = struct {
         return switch (expr.op) {
             .minus => cot.arith.neg(self.current_block, self.loc, operand),
             .tilde => cot.arith.bitNot(self.current_block, self.loc, operand),
-            .bang => operand, // TODO: logical not
+            .bang => blk: {
+                // Logical not: XOR with true (reference: ac Codegen.cpp)
+                const true_val = cot.arith.constant.boolean(self.current_block, self.loc, true);
+                break :blk cot.arith.bitXor(self.current_block, self.loc, operand, true_val);
+            },
             else => operand,
         };
     }
@@ -728,8 +759,30 @@ pub const Codegen = struct {
     }
 
     fn emitIndex(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        _ = expr;
-        // TODO: cir.elem_val / cir.slice_elem
+        const base = try self.emitExpr(expr.lhs.?, null);
+        const base_ty = base.getType();
+
+        if (cot.types.isArray(base_ty)) {
+            const elem_ty = cot.types.arrayElementType(base_ty);
+            // Constant index: use cir.elem_val (extractvalue-like)
+            if (expr.rhs) |rhs| {
+                if (rhs.kind == .int_lit) {
+                    return cot.arrays.elemVal(self.current_block, self.loc, elem_ty, base, rhs.int_val);
+                }
+                // Dynamic index: alloca + elem_ptr + load
+                const idx = try self.emitExpr(rhs, null);
+                const addr = cot.memory.alloca(self.current_block, self.loc, base_ty);
+                cot.memory.store(self.current_block, self.loc, base, addr);
+                const ptr = cot.arrays.elemPtr(self.current_block, self.loc, self.ty_ptr, addr, idx, base_ty);
+                return cot.memory.load(self.current_block, self.loc, ptr, elem_ty);
+            }
+        } else if (cot.types.isSlice(base_ty)) {
+            const elem_ty = cot.types.sliceElementType(base_ty);
+            if (expr.rhs) |rhs| {
+                const idx = try self.emitExpr(rhs, null);
+                return cot.slices.elem(self.current_block, self.loc, elem_ty, base, idx);
+            }
+        }
         return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
     }
 
@@ -765,9 +818,17 @@ pub const Codegen = struct {
     }
 
     fn emitArrayLit(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        _ = expr;
-        // TODO: cir.array_init
-        return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
+        if (!expr.has_args or expr.args.items.len == 0)
+            return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
+
+        var elem_vals: [64]Value = undefined;
+        for (expr.args.items, 0..) |arg, i| {
+            elem_vals[i] = try self.emitExpr(arg, null);
+        }
+        const n = expr.args.items.len;
+        const elem_ty = elem_vals[0].getType();
+        const arr_ty = cot.types.arrayType(self.ctx, @intCast(n), elem_ty);
+        return cot.arrays.init(self.current_block, self.loc, arr_ty, elem_vals[0..n]);
     }
 
     fn emitAddrOf(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
@@ -786,11 +847,9 @@ pub const Codegen = struct {
         const inner = expr.lhs.?;
         if (inner.kind == .ident) {
             if (self.vars.get(inner.name)) |info| {
-                // Load the pointer value from the alloca
                 const ptr_val = cot.memory.load(self.current_block, self.loc, info.addr, info.ty);
-                // Load through the pointer — need to know the pointee type
-                // For now assume i32 (TODO: proper pointee type tracking)
-                return cot.memory.load(self.current_block, self.loc, ptr_val, self.ty_i32);
+                const pointee_ty = info.pointee_ty orelse self.ty_i32;
+                return cot.memory.load(self.current_block, self.loc, ptr_val, pointee_ty);
             }
         }
         const ptr_val = try self.emitExpr(inner, null);
@@ -859,8 +918,24 @@ pub const Codegen = struct {
     }
 
     fn emitSliceFrom(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        _ = expr;
-        // TODO: cir.array_to_slice
+        // arr[lo..hi] → alloca array, cir.array_to_slice
+        const base = try self.emitExpr(expr.lhs.?, null);
+        const base_ty = base.getType();
+
+        if (cot.types.isArray(base_ty)) {
+            const elem_ty = cot.types.arrayElementType(base_ty);
+            const slice_ty = cot.types.sliceType(self.ctx, elem_ty);
+            // Store array to get a stable address for slicing
+            const addr = cot.memory.alloca(self.current_block, self.loc, base_ty);
+            cot.memory.store(self.current_block, self.loc, base, addr);
+            // Emit start and end indices
+            const lo = if (expr.rhs) |rhs| try self.emitExpr(rhs, null) else cot.arith.constant.int(self.current_block, self.loc, self.ty_i64, 0);
+            const hi = if (expr.has_args and expr.args.items.len > 0)
+                try self.emitExpr(expr.args.items[0], null)
+            else
+                cot.arith.constant.int(self.current_block, self.loc, self.ty_i64, cot.types.arraySize(base_ty));
+            return cot.slices.arrayToSlice(self.current_block, self.loc, slice_ty, addr, lo, hi);
+        }
         return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
     }
 
