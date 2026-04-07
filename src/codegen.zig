@@ -9,8 +9,6 @@ const parser = @import("parser");
 const scanner = @import("scanner");
 const TokenKind = scanner.TokenKind;
 
-const c = cot.c.cir;
-
 const Context = cot.Context;
 const Module = cot.Module;
 const Block = cot.Block;
@@ -56,6 +54,9 @@ pub const Codegen = struct {
     struct_defs: std.StringHashMap(parser.StructDef) = undefined,
     enum_types: std.StringHashMap(Type) = undefined,
     enum_defs: std.StringHashMap(parser.EnumDef) = undefined,
+
+    // Scratch buffer for func.call result types (avoids dangling slice)
+    call_result_buf: [1]Type = undefined,
 
     pub fn init(alloc: std.mem.Allocator, filename: [*:0]const u8) Codegen {
         const ctx = Context.create();
@@ -173,27 +174,21 @@ pub const Codegen = struct {
             if (n > 0) @ptrCast(&param_locs) else null,
         );
 
-        const body_region = cot.ir.Region.create();
-        body_region.appendOwnedBlock(entry_block);
+        // Create func.func via the C API — handles region, attributes, insertion
+        const func_op = cot.func.create(
+            self.module_body, self.loc, self.zstr(fd.name),
+            func_type, entry_block,
+        );
 
-        var func_state = cot.ir.OperationState.get("func.func", self.loc);
-        func_state.addAttribute(self.ctx, "sym_name", cot.ir.Attribute.string(self.ctx, self.zstr(fd.name)));
-        func_state.addAttribute(self.ctx, "function_type", cot.ir.Attribute.typeAttr(func_type));
-        func_state.addOwnedRegions(&.{body_region});
-        const func_op = func_state.create();
-        self.module_body.appendOwnedOperation(func_op);
-
-        // Set up variable scope — get the region back from the created op
+        // Set up codegen state
         self.current_block = entry_block;
         self.block_terminated = false;
-        const created_func = cot.ir.Operation{ .raw = func_op.raw };
-        self.current_func_region = created_func.getRegion(0);
+        self.current_func_region = cot.func.getBodyRegion(func_op);
         self.vars = std.StringHashMap(VarInfo).init(self.alloc);
 
-        // Bind parameters
+        // Bind parameters: alloca + store for mutable access
         for (fd.params.items, 0..) |p, i| {
-            const arg = Value{ .raw = c.mlirBlockGetArgument(entry_block.raw, @intCast(i)) };
-            // Alloca + store for mutable access
+            const arg = entry_block.getArgument(i);
             const addr = cot.memory.alloca(self.current_block, self.loc, param_types[i]);
             cot.memory.store(self.current_block, self.loc, arg, addr);
             try self.vars.put(p.name, .{ .addr = addr, .ty = param_types[i] });
@@ -206,8 +201,7 @@ pub const Codegen = struct {
 
         // If no explicit return in void function, add one
         if (is_void_ret and !self.block_terminated) {
-            var ret_state = cot.ir.OperationState.get("func.return", self.loc);
-            self.current_block.appendOwnedOperation(ret_state.create());
+            cot.func.ret(self.current_block, self.loc, &.{});
         }
     }
 
@@ -229,7 +223,7 @@ pub const Codegen = struct {
                 self.block_terminated = true;
             },
             .expr_stmt => {
-                if (stmt.expr) |e| _ = try self.emitExpr(e);
+                if (stmt.expr) |e| _ = try self.emitExpr(e, null);
             },
             .let_decl, .var_decl => try self.emitVarDecl(stmt),
             .if_stmt => try self.emitIf(stmt),
@@ -250,24 +244,53 @@ pub const Codegen = struct {
     }
 
     fn emitReturn(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
-        var ret_state = cot.ir.OperationState.get("func.return", self.loc);
         if (stmt.expr) |e| {
-            const val = try self.emitExpr(e);
-            ret_state.addOperands(&.{val});
+            var val = try self.emitExpr(e, self.return_type);
+            // Implicit wrapping: returning T from function returning ?T
+            if (cot.types.isOptional(self.return_type) and !cot.types.isOptional(val.getType())) {
+                val = cot.optionals.wrap(self.current_block, self.loc, self.return_type, val);
+            }
+            // Implicit wrapping: returning T from function returning T!error
+            if (cot.types.isErrorUnion(self.return_type) and !cot.types.isErrorUnion(val.getType())) {
+                val = cot.errors.wrapResult(self.current_block, self.loc, self.return_type, val);
+            }
+            cot.func.ret(self.current_block, self.loc, &.{val});
+        } else {
+            cot.func.ret(self.current_block, self.loc, &.{});
         }
-        self.current_block.appendOwnedOperation(ret_state.create());
     }
 
     fn emitVarDecl(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
-        const init_val = try self.emitExpr(stmt.expr.?);
-        const val_type = init_val.getType();
-        const addr = cot.memory.alloca(self.current_block, self.loc, val_type);
+        // Resolve declared type if present (e.g., "var x: ?i32 = null")
+        const declared_type: ?Type = if (stmt.var_type.name.len > 0)
+            self.resolveType(stmt.var_type)
+        else
+            null;
+
+        var init_val = try self.emitExpr(stmt.expr.?, declared_type);
+        var val_type = init_val.getType();
+
+        // Implicit wrapping: assigning T to ?T variable
+        if (declared_type) |dt| {
+            if (cot.types.isOptional(dt) and !cot.types.isOptional(val_type)) {
+                init_val = cot.optionals.wrap(self.current_block, self.loc, dt, init_val);
+                val_type = dt;
+            }
+            // Implicit wrapping: assigning T to T!error variable
+            if (cot.types.isErrorUnion(dt) and !cot.types.isErrorUnion(val_type)) {
+                init_val = cot.errors.wrapResult(self.current_block, self.loc, dt, init_val);
+                val_type = dt;
+            }
+        }
+
+        const store_type = declared_type orelse val_type;
+        const addr = cot.memory.alloca(self.current_block, self.loc, store_type);
         cot.memory.store(self.current_block, self.loc, init_val, addr);
-        try self.vars.put(stmt.var_name, .{ .addr = addr, .ty = val_type });
+        try self.vars.put(stmt.var_name, .{ .addr = addr, .ty = store_type });
     }
 
     fn emitIf(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
-        const cond = try self.emitExpr(stmt.expr.?);
+        const cond = try self.emitExpr(stmt.expr.?, null);
         const then_block = Block.create(0, null, null);
         const else_block = Block.create(0, null, null);
         const merge_block = Block.create(0, null, null);
@@ -309,7 +332,7 @@ pub const Codegen = struct {
         // Condition
         self.current_block = cond_block;
         self.appendBlockToFunc(cond_block);
-        const cond = try self.emitExpr(stmt.expr.?);
+        const cond = try self.emitExpr(stmt.expr.?, null);
         cot.flow.condBr(self.current_block, self.loc, cond, body_block, exit_block);
 
         // Body
@@ -336,8 +359,8 @@ pub const Codegen = struct {
     fn emitFor(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
         // for (lo..hi) |i| { body }
         // → var i = lo; while (i < hi) { body; i += 1; }
-        const lo = try self.emitExpr(stmt.expr.?);
-        const hi = if (stmt.range_end) |re| try self.emitExpr(re) else lo;
+        const lo = try self.emitExpr(stmt.expr.?, null);
+        const hi = if (stmt.range_end) |re| try self.emitExpr(re, null) else lo;
 
         const addr = cot.memory.alloca(self.current_block, self.loc, lo.getType());
         cot.memory.store(self.current_block, self.loc, lo, addr);
@@ -387,7 +410,22 @@ pub const Codegen = struct {
 
     fn emitAssign(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
         const target = stmt.lhs_expr orelse return;
-        const val = try self.emitExpr(stmt.expr.?);
+        // Resolve expected type from the target variable
+        const target_type: ?Type = if (target.kind == .ident)
+            (if (self.vars.get(target.name)) |info| info.ty else null)
+        else
+            null;
+        var val = try self.emitExpr(stmt.expr.?, target_type);
+
+        // Implicit wrapping for optional/error union assignment
+        if (target_type) |tt| {
+            if (cot.types.isOptional(tt) and !cot.types.isOptional(val.getType())) {
+                val = cot.optionals.wrap(self.current_block, self.loc, tt, val);
+            }
+            if (cot.types.isErrorUnion(tt) and !cot.types.isErrorUnion(val.getType())) {
+                val = cot.errors.wrapResult(self.current_block, self.loc, tt, val);
+            }
+        }
 
         if (target.kind == .ident) {
             if (self.vars.get(target.name)) |info| {
@@ -395,14 +433,14 @@ pub const Codegen = struct {
             }
         } else if (target.kind == .deref) {
             // p.* = val → store to the pointer held in the variable
-            const ptr_val = try self.emitExpr(target.lhs.?);
+            const ptr_val = try self.emitExpr(target.lhs.?, null);
             cot.memory.store(self.current_block, self.loc, val, ptr_val);
         }
     }
 
     fn emitCompoundAssign(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
         const target = stmt.lhs_expr orelse return;
-        const rhs = try self.emitExpr(stmt.expr.?);
+        const rhs = try self.emitExpr(stmt.expr.?, null);
 
         if (target.kind == .ident) {
             if (self.vars.get(target.name)) |info| {
@@ -419,8 +457,76 @@ pub const Codegen = struct {
         }
     }
 
-    fn emitSwitch(_: *Codegen, _: *const parser.Stmt) CodegenError!void {
-        // TODO: switch lowering via cir.switch or chained condbr
+    fn emitSwitch(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
+        // Emit scrutinee and extract tag value
+        const scrutinee = try self.emitExpr(stmt.expr.?, null);
+        const scrutinee_ty = scrutinee.getType();
+        if (!cot.types.isEnum(scrutinee_ty)) return;
+
+        const tag_ty = cot.types.enumTagType(scrutinee_ty);
+        const tag = cot.enums.value(self.current_block, self.loc, tag_ty, scrutinee);
+
+        // Build case values and blocks
+        const num_arms = stmt.switch_variants.items.len;
+        var case_values: [64]i64 = undefined;
+        var case_blocks: [64]Block = undefined;
+        var case_count: usize = 0;
+        var default_idx: ?usize = null;
+
+        for (stmt.switch_variants.items, 0..) |variant_name, arm_idx| {
+            if (std.mem.eql(u8, variant_name, "_")) {
+                // else/default arm
+                default_idx = arm_idx;
+            } else {
+                // Find variant index in the enum type
+                const nv = cot.types.enumVariantCount(scrutinee_ty);
+                var found_idx: i64 = 0;
+                for (0..nv) |vi| {
+                    if (std.mem.eql(u8, cot.types.enumVariantName(scrutinee_ty, vi), variant_name)) {
+                        found_idx = @intCast(vi);
+                        break;
+                    }
+                }
+                case_values[case_count] = found_idx;
+                case_blocks[case_count] = Block.create(0, null, null);
+                case_count += 1;
+            }
+        }
+
+        const merge_block = Block.create(0, null, null);
+        const default_block = if (default_idx != null) Block.create(0, null, null) else merge_block;
+
+        // Emit cir.switch
+        cot.flow.switchOp(
+            self.current_block, self.loc, tag, default_block,
+            case_values[0..case_count], case_blocks[0..case_count],
+        );
+
+        // Emit each case arm body
+        var case_idx: usize = 0;
+        for (0..num_arms) |arm_idx| {
+            const is_default = if (default_idx) |di| (arm_idx == di) else false;
+            const arm_block = if (is_default) default_block else blk: {
+                const b = case_blocks[case_idx];
+                case_idx += 1;
+                break :blk b;
+            };
+
+            self.appendBlockToFunc(arm_block);
+            self.current_block = arm_block;
+            self.block_terminated = false;
+
+            for (stmt.switch_bodies.items[arm_idx].items) |s| {
+                try self.emitStmt(s);
+            }
+            if (!self.block_terminated) {
+                cot.flow.br(self.current_block, self.loc, merge_block);
+            }
+        }
+
+        self.appendBlockToFunc(merge_block);
+        self.current_block = merge_block;
+        self.block_terminated = false;
     }
 
     // ===----------------------------------------------------------------------===
@@ -434,15 +540,27 @@ pub const Codegen = struct {
         return self.alloc.dupeZ(u8, s) catch "";
     }
 
-    fn emitExpr(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
+    fn emitExpr(self: *Codegen, expr: *const parser.Expr, expected_type: ?Type) CodegenError!Value {
+        // Unwrap expected type for sub-expressions:
+        // If expected is optional and expr is not null, pass the payload type.
+        // If expected is error_union and expr is not an error call, pass the payload type.
+        var et = expected_type;
+        if (et) |ety| {
+            if (cot.types.isOptional(ety) and expr.kind != .null_lit) {
+                et = cot.types.optionalPayloadType(ety);
+            } else if (cot.types.isErrorUnion(ety) and expr.kind != .error_val) {
+                et = cot.types.errorUnionPayloadType(ety);
+            }
+        }
+
         return switch (expr.kind) {
-            .int_lit => cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, expr.int_val),
-            .float_lit => cot.arith.constant.float(self.current_block, self.loc, self.ty_f64, expr.float_val),
+            .int_lit => cot.arith.constant.int(self.current_block, self.loc, et orelse self.ty_i32, expr.int_val),
+            .float_lit => cot.arith.constant.float(self.current_block, self.loc, et orelse self.ty_f64, expr.float_val),
             .bool_lit => cot.arith.constant.boolean(self.current_block, self.loc, expr.bool_val),
             .string_lit => self.emitStringLit(expr),
-            .null_lit => self.emitNullLit(),
+            .null_lit => self.emitNullLit(expected_type),
             .ident => self.emitIdent(expr),
-            .bin_op => self.emitBinOp(expr),
+            .bin_op => self.emitBinOp(expr, et),
             .unary_op => self.emitUnaryOp(expr),
             .call => self.emitCall(expr),
             .field_access => self.emitFieldAccess(expr),
@@ -455,7 +573,8 @@ pub const Codegen = struct {
             .try_unwrap => self.emitTryUnwrap(expr),
             .cast_as => self.emitCastAs(expr),
             .slice_from => self.emitSliceFrom(expr),
-            .dot_ident => self.emitDotIdent(expr),
+            .dot_ident => self.emitDotIdent(expr, et),
+            .error_val => self.emitErrorVal(expr, expected_type),
         };
     }
 
@@ -464,9 +583,12 @@ pub const Codegen = struct {
         return cot.slices.stringConstant(self.current_block, self.loc, slice_ty, self.zstr(expr.str_val));
     }
 
-    fn emitNullLit(self: *Codegen) Value {
-        // null → cir.none with inferred optional type (use i32 as default payload)
-        const opt_ty = cot.types.optionalType(self.ctx, self.ty_i32);
+    fn emitNullLit(self: *Codegen, expected_type: ?Type) Value {
+        // null → cir.none with the expected optional type
+        const opt_ty = if (expected_type) |et|
+            (if (cot.types.isOptional(et)) et else cot.types.optionalType(self.ctx, self.ty_i32))
+        else
+            cot.types.optionalType(self.ctx, self.ty_i32);
         return cot.optionals.none(self.current_block, self.loc, opt_ty);
     }
 
@@ -477,9 +599,13 @@ pub const Codegen = struct {
         return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
     }
 
-    fn emitBinOp(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        const lhs = try self.emitExpr(expr.lhs.?);
-        const rhs = try self.emitExpr(expr.rhs.?);
+    fn emitBinOp(self: *Codegen, expr: *const parser.Expr, expected_type: ?Type) CodegenError!Value {
+        // orelse and catch need special handling — LHS type determines RHS type
+        if (expr.op == .kw_orelse) return self.emitOrelse(expr);
+        if (expr.op == .kw_catch) return self.emitCatch(expr, expected_type);
+
+        const lhs = try self.emitExpr(expr.lhs.?, null);
+        const rhs = try self.emitExpr(expr.rhs.?, null);
 
         return switch (expr.op) {
             .plus => cot.arith.add(self.current_block, self.loc, lhs, rhs),
@@ -498,14 +624,42 @@ pub const Codegen = struct {
             .less_equal => cot.arith.cmp(self.current_block, self.loc, 3, lhs, rhs),   // sle
             .greater => cot.arith.cmp(self.current_block, self.loc, 4, lhs, rhs),      // sgt
             .greater_equal => cot.arith.cmp(self.current_block, self.loc, 5, lhs, rhs), // sge
-            .kw_orelse => lhs, // TODO: proper orelse lowering
-            .kw_catch => lhs,  // TODO: proper catch lowering
             else => cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0),
         };
     }
 
+    /// x orelse default → is_non_null ? payload : default
+    fn emitOrelse(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
+        const lhs = try self.emitExpr(expr.lhs.?, null);
+        const lhs_ty = lhs.getType();
+        if (!cot.types.isOptional(lhs_ty)) return lhs;
+
+        const payload_ty = cot.types.optionalPayloadType(lhs_ty);
+        const is_nn = cot.optionals.isNonNull(self.current_block, self.loc, lhs);
+        const payload = cot.optionals.payload(self.current_block, self.loc, payload_ty, lhs);
+        const rhs = try self.emitExpr(expr.rhs.?, payload_ty);
+        return cot.arith.select(self.current_block, self.loc, is_nn, payload, rhs);
+    }
+
+    /// x catch default → !is_error ? payload : default
+    fn emitCatch(self: *Codegen, expr: *const parser.Expr, expected_type: ?Type) CodegenError!Value {
+        _ = expected_type;
+        const lhs = try self.emitExpr(expr.lhs.?, null);
+        const lhs_ty = lhs.getType();
+        if (!cot.types.isErrorUnion(lhs_ty)) return lhs;
+
+        const payload_ty = cot.types.errorUnionPayloadType(lhs_ty);
+        const is_err = cot.errors.isError(self.current_block, self.loc, lhs);
+        // is_ok = !is_error (XOR with true)
+        const true_val = cot.arith.constant.boolean(self.current_block, self.loc, true);
+        const is_ok = cot.arith.bitXor(self.current_block, self.loc, is_err, true_val);
+        const payload = cot.errors.payload(self.current_block, self.loc, payload_ty, lhs);
+        const rhs = try self.emitExpr(expr.rhs.?, payload_ty);
+        return cot.arith.select(self.current_block, self.loc, is_ok, payload, rhs);
+    }
+
     fn emitUnaryOp(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        const operand = try self.emitExpr(expr.lhs.?);
+        const operand = try self.emitExpr(expr.lhs.?, null);
         return switch (expr.op) {
             .minus => cot.arith.neg(self.current_block, self.loc, operand),
             .tilde => cot.arith.bitNot(self.current_block, self.loc, operand),
@@ -518,7 +672,7 @@ pub const Codegen = struct {
         // Special builtins
         if (std.mem.eql(u8, expr.name, "assert") or std.mem.eql(u8, expr.name, "@assert")) {
             if (expr.has_args and expr.args.items.len > 0) {
-                const cond = try self.emitExpr(expr.args.items[0]);
+                const cond = try self.emitExpr(expr.args.items[0], null);
                 cot.testing.assert(self.current_block, self.loc, cond, "assertion failed");
             }
             return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
@@ -529,50 +683,34 @@ pub const Codegen = struct {
         var n: usize = 0;
         if (expr.has_args) {
             for (expr.args.items) |arg| {
-                arg_vals[n] = try self.emitExpr(arg);
+                arg_vals[n] = try self.emitExpr(arg, null);
                 n += 1;
             }
         }
 
-        // Look up callee return type from the function's symbol
-        var ret_type = self.ty_i32;
-        var is_void = false;
-        const name_ref = c.MlirStringRef{ .data = expr.name.ptr, .length = expr.name.len };
-        const sym_table = c.mlirSymbolTableCreate(self.module.getOperation().raw);
-        defer c.mlirSymbolTableDestroy(sym_table);
-        const callee_op = c.mlirSymbolTableLookup(sym_table, name_ref);
-        if (!c.mlirOperationIsNull(callee_op)) {
-            const ft_attr = c.mlirOperationGetAttributeByName(
-                callee_op,
-                c.mlirStringRefCreateFromCString("function_type"),
-            );
-            if (!c.mlirAttributeIsNull(ft_attr)) {
-                const fty = c.mlirTypeAttrGetValue(ft_attr);
-                if (c.mlirFunctionTypeGetNumResults(fty) == 0) {
-                    is_void = true;
-                } else {
-                    ret_type = .{ .raw = c.mlirFunctionTypeGetResult(fty, 0) };
-                }
-            }
-        }
+        // Look up callee return type via the C API
+        const callee_name = self.zstr(expr.name);
+        const module_op = self.module.getOperation();
+        const is_void = cot.func.isVoidReturn(module_op, callee_name);
+        const result_types: []const Type = if (is_void) &.{} else blk: {
+            const ret_type = cot.func.lookupReturnType(module_op, callee_name) orelse self.ty_i32;
+            self.call_result_buf[0] = ret_type;
+            break :blk self.call_result_buf[0..1];
+        };
 
-        var state = cot.ir.OperationState.get("func.call", self.loc);
-        state.addOperands(arg_vals[0..n]);
-        if (!is_void) state.addResults(&.{ret_type});
-        state.addAttribute(self.ctx, "callee", cot.ir.Attribute{
-            .raw = c.mlirFlatSymbolRefAttrGet(self.ctx.raw, c.mlirStringRefCreateFromCString(self.zstr(expr.name))),
-        });
-        const op = state.create();
-        self.current_block.appendOwnedOperation(op);
+        const result = cot.func.call(
+            self.current_block, self.loc, callee_name,
+            arg_vals[0..n], result_types,
+        );
 
         if (is_void) {
             return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
         }
-        return Value{ .raw = c.mlirOperationGetResult(op.raw, 0) };
+        return result;
     }
 
     fn emitFieldAccess(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        const base = try self.emitExpr(expr.lhs.?);
+        const base = try self.emitExpr(expr.lhs.?, null);
         const base_ty = base.getType();
         // Look up field index by name in the struct def
         if (cot.types.isStruct(base_ty)) {
@@ -610,7 +748,7 @@ pub const Codegen = struct {
             if (expr.has_fields) {
                 for (expr.fields.items) |finit| {
                     if (std.mem.eql(u8, finit.name, field.name)) {
-                        field_vals[fi] = self.emitExpr(finit.value) catch
+                        field_vals[fi] = self.emitExpr(finit.value, null) catch
                             cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
                         found = true;
                         break;
@@ -655,24 +793,52 @@ pub const Codegen = struct {
                 return cot.memory.load(self.current_block, self.loc, ptr_val, self.ty_i32);
             }
         }
-        const ptr_val = try self.emitExpr(inner);
+        const ptr_val = try self.emitExpr(inner, null);
         return cot.memory.load(self.current_block, self.loc, ptr_val, self.ty_i32);
     }
 
     fn emitForceUnwrap(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        const opt_val = try self.emitExpr(expr.lhs.?);
-        // .? → optional_payload
-        return cot.optionals.payload(self.current_block, self.loc, self.ty_i32, opt_val);
+        const opt_val = try self.emitExpr(expr.lhs.?, null);
+        // .? → optional_payload — extract payload type from the optional
+        const opt_ty = opt_val.getType();
+        const payload_ty = if (cot.types.isOptional(opt_ty))
+            cot.types.optionalPayloadType(opt_ty)
+        else
+            self.ty_i32;
+        return cot.optionals.payload(self.current_block, self.loc, payload_ty, opt_val);
     }
 
     fn emitTryUnwrap(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        const eu_val = try self.emitExpr(expr.lhs.?);
-        // try → error_payload (simplified — real try needs error propagation)
-        return cot.errors.payload(self.current_block, self.loc, self.ty_i32, eu_val);
+        const eu_val = try self.emitExpr(expr.lhs.?, null);
+        // try → check is_error, branch: error path propagates, success path extracts payload
+        const eu_ty = eu_val.getType();
+        if (!cot.types.isErrorUnion(eu_ty)) return eu_val;
+
+        const payload_ty = cot.types.errorUnionPayloadType(eu_ty);
+        const is_err = cot.errors.isError(self.current_block, self.loc, eu_val);
+
+        const err_block = Block.create(0, null, null);
+        const ok_block = Block.create(0, null, null);
+
+        cot.flow.condBr(self.current_block, self.loc, is_err, err_block, ok_block);
+
+        // Error path: propagate error to caller
+        self.appendBlockToFunc(err_block);
+        self.current_block = err_block;
+        self.block_terminated = false;
+        const err_code = cot.errors.code(self.current_block, self.loc, eu_val);
+        const wrapped = cot.errors.wrapError(self.current_block, self.loc, self.return_type, err_code);
+        cot.func.ret(self.current_block, self.loc, &.{wrapped});
+
+        // Success path: extract payload
+        self.appendBlockToFunc(ok_block);
+        self.current_block = ok_block;
+        self.block_terminated = false;
+        return cot.errors.payload(self.current_block, self.loc, payload_ty, eu_val);
     }
 
     fn emitCastAs(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        const input = try self.emitExpr(expr.lhs.?);
+        const input = try self.emitExpr(expr.lhs.?, null);
         // @intCast — use function return type as target
         const target = if (std.mem.eql(u8, expr.cast_type.name, "__intcast"))
             self.return_type
@@ -698,9 +864,41 @@ pub const Codegen = struct {
         return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
     }
 
-    fn emitDotIdent(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        _ = expr;
-        // .Variant → enum constant (needs context to determine which enum)
+    fn emitErrorVal(self: *Codegen, expr: *const parser.Expr, expected_type: ?Type) CodegenError!Value {
+        // error.Name → cir.wrap_error with a hash-based error code
+        // Requires error_union type context for the wrap_error return type
+        const eu_ty = if (expected_type) |et|
+            (if (cot.types.isErrorUnion(et)) et else cot.types.errorUnionType(self.ctx, self.ty_i32))
+        else
+            cot.types.errorUnionType(self.ctx, self.ty_i32);
+
+        // Generate a non-zero error code from the variant name
+        var code: i64 = 1;
+        for (expr.name) |ch| {
+            code = code *% 31 +% @as(i64, ch);
+        }
+        if (code <= 0) code = 1; // ensure non-zero
+        const code_val = cot.arith.constant.int(self.current_block, self.loc, self.ty_i16, code);
+        return cot.errors.wrapError(self.current_block, self.loc, eu_ty, code_val);
+    }
+
+    fn emitDotIdent(self: *Codegen, expr: *const parser.Expr, expected_type: ?Type) CodegenError!Value {
+        // .Variant → cir.enum_constant with the expected enum type
+        if (expected_type) |et| {
+            if (cot.types.isEnum(et)) {
+                return cot.enums.constant(self.current_block, self.loc, et, self.zstr(expr.name));
+            }
+        }
+        // Fallback: search all registered enum types for the variant name
+        var enum_iter = self.enum_defs.iterator();
+        while (enum_iter.next()) |entry| {
+            for (entry.value_ptr.variants.items) |v| {
+                if (std.mem.eql(u8, v, expr.name)) {
+                    const ety = self.enum_types.get(entry.key_ptr.*).?;
+                    return cot.enums.constant(self.current_block, self.loc, ety, self.zstr(expr.name));
+                }
+            }
+        }
         return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
     }
 

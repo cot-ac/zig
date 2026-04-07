@@ -56,6 +56,7 @@ pub const ExprKind = enum {
     cast_as,
     slice_from,
     dot_ident, // .variant (enum literal)
+    error_val, // error.Name (error value)
 };
 
 pub const Expr = struct {
@@ -237,6 +238,17 @@ pub const Parser = struct {
         } else if (self.peek() == .kw_enum) {
             self.advance();
             try mod.enums.append(self.alloc,try self.parseEnumBody(name));
+        } else if (self.peek() == .kw_error) {
+            // const MyError = error{BadValue, ...}; — skip error set declaration
+            // CIR doesn't track error set types; error codes are u16.
+            self.advance();
+            self.expect(.l_brace);
+            while (self.peek() != .r_brace) {
+                _ = self.expectIdent();
+                if (self.peek() == .comma) self.advance();
+            }
+            self.expect(.r_brace);
+            if (self.peek() == .semicolon) self.advance();
         } else {
             return error.UnexpectedToken;
         }
@@ -352,10 +364,24 @@ pub const Parser = struct {
         };
         self.advance();
 
-        // T!error — error union (check for ! after base type)
+        // Error union: T! (ac style) or ErrorSet!T (Zig style)
         if (self.peek() == .bang) {
             self.advance();
             ty.is_error_union = true;
+            // Zig style: ErrorSet!PayloadType — parse the payload type after !
+            const next = self.peek();
+            if (next == .ty_i8 or next == .ty_i16 or next == .ty_i32 or
+                next == .ty_i64 or next == .ty_u8 or next == .ty_u16 or
+                next == .ty_u32 or next == .ty_u64 or next == .ty_f32 or
+                next == .ty_f64 or next == .ty_bool or next == .ty_void or
+                next == .identifier)
+            {
+                // The identifier before ! was the error set name (ignored in CIR).
+                // The type after ! is the actual payload type.
+                var payload = try self.parseTypeRef();
+                payload.is_error_union = true;
+                return payload;
+            }
         }
 
         return ty;
@@ -824,6 +850,15 @@ pub const Parser = struct {
                 self.advance();
                 const node = try self.alloc.create(Expr);
                 node.* = .{ .kind = .null_lit };
+                return node;
+            },
+            .kw_error => {
+                // error.Name — error value literal
+                self.advance();
+                self.expect(.dot);
+                const ename = self.expectIdent();
+                const node = try self.alloc.create(Expr);
+                node.* = .{ .kind = .error_val, .name = ename };
                 return node;
             },
             .dot => {

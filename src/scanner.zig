@@ -42,6 +42,7 @@ pub const TokenKind = enum {
     kw_switch,
     kw_try,
     kw_catch,
+    kw_error,
     kw_unreachable,
 
     // Builtin types
@@ -134,6 +135,7 @@ const keywords = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "switch", .kw_switch },
     .{ "try", .kw_try },
     .{ "catch", .kw_catch },
+    .{ "error", .kw_error },
     .{ "true", .true_lit },
     .{ "false", .false_lit },
     .{ "unreachable", .kw_unreachable },

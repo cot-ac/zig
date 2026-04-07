@@ -1,14 +1,22 @@
-const Color = enum {
-    Red,
-    Green,
-    Blue,
-};
+const Color = enum { Red, Green, Blue };
 
-fn colorVal(c: Color) i32 {
-    return @as(i32, c);
+fn colorValue(c: Color) i32 {
+    switch (c) {
+        .Red => {
+            return 10;
+        },
+        .Green => {
+            return 20;
+        },
+        .Blue => {
+            return 42;
+        },
+    }
+    return 0;
 }
 
-fn main() i32 {
-    var b: Color = .Blue;
-    return colorVal(b);
+pub fn main() u8 {
+    const c: Color = .Blue;
+    const result = colorValue(c);
+    return @intCast(result);
 }

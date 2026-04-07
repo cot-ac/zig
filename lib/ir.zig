@@ -79,6 +79,11 @@ pub const Block = struct {
         const op = c.mlirBlockGetFirstOperation(self.raw);
         return if (c.mlirOperationIsNull(op)) null else .{ .raw = op };
     }
+
+    /// Get the block argument at the given index.
+    pub fn getArgument(self: Block, index: usize) Value {
+        return .{ .raw = c.cirBlockGetArgument(self.raw, @intCast(index)) };
+    }
 };
 
 pub const Region = struct {
@@ -302,5 +307,12 @@ pub const Attribute = struct {
 
     pub fn typeAttr(ty: Type) Attribute {
         return .{ .raw = c.mlirTypeAttrGet(ty.raw) };
+    }
+
+    pub fn flatSymbolRef(ctx: Context, name: [*:0]const u8) Attribute {
+        return .{ .raw = c.mlirFlatSymbolRefAttrGet(
+            ctx.raw,
+            c.mlirStringRefCreateFromCString(name),
+        ) };
     }
 };

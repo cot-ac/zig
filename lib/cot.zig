@@ -27,6 +27,9 @@ pub const Type = ir.Type;
 pub const Location = ir.Location;
 pub const Operation = ir.Operation;
 
+// Function building (func dialect).
+pub const func = ops.func;
+
 // Construct-namespaced op builders.
 pub const arith = ops.arith;
 pub const memory = ops.memory;

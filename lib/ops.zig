@@ -7,6 +7,52 @@ const Value = ir.Value;
 const Type = ir.Type;
 const Location = ir.Location;
 const Operation = ir.Operation;
+const Region = ir.Region;
+const Context = ir.Context;
+const Module = ir.Module;
+
+// ===----------------------------------------------------------------------===
+// func — function creation, calls, returns, type inspection
+// ===----------------------------------------------------------------------===
+
+pub const func = struct {
+    /// Create a func.func operation with a body region containing entryBlock.
+    /// Returns the created func.func operation.
+    pub fn create(module_body: Block, loc: Location, name: [*:0]const u8, func_type: Type, entry_block: Block) Operation {
+        return .{ .raw = c.cirFuncCreate(module_body.raw, loc.raw, name, func_type.raw, entry_block.raw) };
+    }
+
+    /// Get the body region of a func.func operation.
+    pub fn getBodyRegion(func_op: Operation) Region {
+        return .{ .raw = c.cirFuncGetBodyRegion(func_op.raw) };
+    }
+
+    /// Build a func.call. Returns the result value, or null Value for void calls.
+    pub fn call(block: Block, loc: Location, callee: [*:0]const u8, args: []const Value, result_types: []const Type) Value {
+        return .{ .raw = c.cirFuncCall(
+            block.raw, loc.raw, callee,
+            @intCast(args.len), @ptrCast(args.ptr),
+            @intCast(result_types.len), @ptrCast(result_types.ptr),
+        ) };
+    }
+
+    /// Build a func.return.
+    pub fn ret(block: Block, loc: Location, values: []const Value) void {
+        c.cirFuncReturn(block.raw, loc.raw, @intCast(values.len), @ptrCast(values.ptr));
+    }
+
+    /// Look up the return type of a named function in the module.
+    /// Returns null if not found or void.
+    pub fn lookupReturnType(module_op: Operation, name: [*:0]const u8) ?Type {
+        const raw = c.cirFuncLookupReturnType(module_op.raw, name);
+        return if (raw.ptr == null) null else .{ .raw = raw };
+    }
+
+    /// Check if a named function returns void.
+    pub fn isVoidReturn(module_op: Operation, name: [*:0]const u8) bool {
+        return c.cirFuncIsVoidReturn(module_op.raw, name);
+    }
+};
 
 // ===----------------------------------------------------------------------===
 // arith — constants, arithmetic, comparison, bitwise, casts
@@ -126,6 +172,15 @@ pub const flow = struct {
     }
     pub fn condBr(block: Block, loc: Location, cond: Value, true_dest: Block, false_dest: Block) void {
         c.cirBuildCondBr(block.raw, loc.raw, cond.raw, true_dest.raw, false_dest.raw);
+    }
+    /// Multi-way branch on integer value.
+    pub fn switchOp(block: Block, loc: Location, value: Value, default_dest: Block, case_values: []const i64, case_dests: []const Block) void {
+        c.cirBuildSwitch(
+            block.raw, loc.raw, value.raw, default_dest.raw,
+            @intCast(case_values.len),
+            case_values.ptr,
+            @ptrCast(case_dests.ptr),
+        );
     }
     pub fn trap(block: Block, loc: Location) void {
         c.cirBuildTrap(block.raw, loc.raw);
