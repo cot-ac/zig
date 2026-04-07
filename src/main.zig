@@ -79,6 +79,10 @@ pub fn main() !void {
 
     gen.emit(&mod) catch |err| {
         std.debug.print("error: codegen failed: {}\n", .{err});
+        // Print a stack trace if possible
+        if (@errorReturnTrace()) |trace| {
+            std.debug.dumpStackTrace(trace.*);
+        }
         std.process.exit(1);
     };
 

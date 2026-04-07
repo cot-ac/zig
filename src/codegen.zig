@@ -18,6 +18,11 @@ const Value = cot.Value;
 const Type = cot.Type;
 const Location = cot.Location;
 
+const VarInfo = struct {
+    addr: Value, // alloca pointer
+    ty: Type, // stored type
+};
+
 pub const Codegen = struct {
     ctx: Context,
     loc: Location,
@@ -27,11 +32,13 @@ pub const Codegen = struct {
 
     // Per-function state
     current_block: Block = undefined,
+    current_func_region: cot.ir.Region = undefined,
     return_type: Type = undefined,
-    vars: std.StringHashMap(Value) = undefined,
+    vars: std.StringHashMap(VarInfo) = undefined,
     // Break/continue targets
     break_dest: ?Block = null,
     continue_dest: ?Block = null,
+    block_terminated: bool = false,
 
     // Type cache
     ty_void: Type = undefined,
@@ -173,11 +180,15 @@ pub const Codegen = struct {
         func_state.addAttribute(self.ctx, "sym_name", cot.ir.Attribute.string(self.ctx, self.zstr(fd.name)));
         func_state.addAttribute(self.ctx, "function_type", cot.ir.Attribute.typeAttr(func_type));
         func_state.addOwnedRegions(&.{body_region});
-        self.module_body.appendOwnedOperation(func_state.create());
+        const func_op = func_state.create();
+        self.module_body.appendOwnedOperation(func_op);
 
-        // Set up variable scope
+        // Set up variable scope — get the region back from the created op
         self.current_block = entry_block;
-        self.vars = std.StringHashMap(Value).init(self.alloc);
+        self.block_terminated = false;
+        const created_func = cot.ir.Operation{ .raw = func_op.raw };
+        self.current_func_region = created_func.getRegion(0);
+        self.vars = std.StringHashMap(VarInfo).init(self.alloc);
 
         // Bind parameters
         for (fd.params.items, 0..) |p, i| {
@@ -185,7 +196,7 @@ pub const Codegen = struct {
             // Alloca + store for mutable access
             const addr = cot.memory.alloca(self.current_block, self.loc, param_types[i]);
             cot.memory.store(self.current_block, self.loc, arg, addr);
-            try self.vars.put(p.name, addr);
+            try self.vars.put(p.name, .{ .addr = addr, .ty = param_types[i] });
         }
 
         // Emit body
@@ -194,7 +205,7 @@ pub const Codegen = struct {
         }
 
         // If no explicit return in void function, add one
-        if (is_void_ret) {
+        if (is_void_ret and !self.block_terminated) {
             var ret_state = cot.ir.OperationState.get("func.return", self.loc);
             self.current_block.appendOwnedOperation(ret_state.create());
         }
@@ -211,8 +222,12 @@ pub const Codegen = struct {
     // ===----------------------------------------------------------------------===
 
     fn emitStmt(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
+        if (self.block_terminated) return; // block already has a terminator
         switch (stmt.kind) {
-            .ret => try self.emitReturn(stmt),
+            .ret => {
+                try self.emitReturn(stmt);
+                self.block_terminated = true;
+            },
             .expr_stmt => {
                 if (stmt.expr) |e| _ = try self.emitExpr(e);
             },
@@ -222,9 +237,11 @@ pub const Codegen = struct {
             .for_stmt => try self.emitFor(stmt),
             .break_stmt => {
                 if (self.break_dest) |dest| cot.flow.br(self.current_block, self.loc, dest);
+                self.block_terminated = true;
             },
             .continue_stmt => {
                 if (self.continue_dest) |dest| cot.flow.br(self.current_block, self.loc, dest);
+                self.block_terminated = true;
             },
             .assign => try self.emitAssign(stmt),
             .compound_assign => try self.emitCompoundAssign(stmt),
@@ -246,7 +263,7 @@ pub const Codegen = struct {
         const val_type = init_val.getType();
         const addr = cot.memory.alloca(self.current_block, self.loc, val_type);
         cot.memory.store(self.current_block, self.loc, init_val, addr);
-        try self.vars.put(stmt.var_name, addr);
+        try self.vars.put(stmt.var_name, .{ .addr = addr, .ty = val_type });
     }
 
     fn emitIf(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
@@ -259,22 +276,26 @@ pub const Codegen = struct {
 
         // Then branch
         self.current_block = then_block;
+        self.block_terminated = false;
         self.appendBlockToFunc(then_block);
         if (stmt.has_then) {
             for (stmt.then_body.items) |s| try self.emitStmt(s);
         }
-        // Branch to merge (if not already terminated)
-        cot.flow.br(self.current_block, self.loc, merge_block);
+        if (!self.block_terminated)
+            cot.flow.br(self.current_block, self.loc, merge_block);
 
         // Else branch
         self.current_block = else_block;
+        self.block_terminated = false;
         self.appendBlockToFunc(else_block);
         if (stmt.has_else) {
             for (stmt.else_body.items) |s| try self.emitStmt(s);
         }
-        cot.flow.br(self.current_block, self.loc, merge_block);
+        if (!self.block_terminated)
+            cot.flow.br(self.current_block, self.loc, merge_block);
 
         self.current_block = merge_block;
+        self.block_terminated = false;
         self.appendBlockToFunc(merge_block);
     }
 
@@ -297,15 +318,18 @@ pub const Codegen = struct {
         self.break_dest = exit_block;
         self.continue_dest = cond_block;
         self.current_block = body_block;
+        self.block_terminated = false;
         self.appendBlockToFunc(body_block);
         if (stmt.has_then) {
             for (stmt.then_body.items) |s| try self.emitStmt(s);
         }
-        cot.flow.br(self.current_block, self.loc, cond_block);
+        if (!self.block_terminated)
+            cot.flow.br(self.current_block, self.loc, cond_block);
         self.break_dest = saved_break;
         self.continue_dest = saved_continue;
 
         self.current_block = exit_block;
+        self.block_terminated = false;
         self.appendBlockToFunc(exit_block);
     }
 
@@ -318,7 +342,7 @@ pub const Codegen = struct {
         const addr = cot.memory.alloca(self.current_block, self.loc, lo.getType());
         cot.memory.store(self.current_block, self.loc, lo, addr);
         if (stmt.var_name.len > 0) {
-            try self.vars.put(stmt.var_name, addr);
+            try self.vars.put(stmt.var_name, .{ .addr = addr, .ty = lo.getType() });
         }
 
         const cond_block = Block.create(0, null, null);
@@ -340,20 +364,24 @@ pub const Codegen = struct {
         self.break_dest = exit_block;
         self.continue_dest = cond_block;
         self.current_block = body_block;
+        self.block_terminated = false;
         self.appendBlockToFunc(body_block);
         if (stmt.has_then) {
             for (stmt.then_body.items) |s| try self.emitStmt(s);
         }
-        // Increment: i += 1
-        const cur = cot.memory.load(self.current_block, self.loc, addr, lo.getType());
-        const one = cot.arith.constant.int(self.current_block, self.loc, lo.getType(), 1);
-        const next = cot.arith.add(self.current_block, self.loc, cur, one);
-        cot.memory.store(self.current_block, self.loc, next, addr);
-        cot.flow.br(self.current_block, self.loc, cond_block);
+        if (!self.block_terminated) {
+            // Increment: i += 1
+            const cur = cot.memory.load(self.current_block, self.loc, addr, lo.getType());
+            const one = cot.arith.constant.int(self.current_block, self.loc, lo.getType(), 1);
+            const next = cot.arith.add(self.current_block, self.loc, cur, one);
+            cot.memory.store(self.current_block, self.loc, next, addr);
+            cot.flow.br(self.current_block, self.loc, cond_block);
+        }
 
         self.break_dest = saved_break;
         self.continue_dest = saved_continue;
         self.current_block = exit_block;
+        self.block_terminated = false;
         self.appendBlockToFunc(exit_block);
     }
 
@@ -362,11 +390,14 @@ pub const Codegen = struct {
         const val = try self.emitExpr(stmt.expr.?);
 
         if (target.kind == .ident) {
-            if (self.vars.get(target.name)) |addr| {
-                cot.memory.store(self.current_block, self.loc, val, addr);
+            if (self.vars.get(target.name)) |info| {
+                cot.memory.store(self.current_block, self.loc, val, info.addr);
             }
+        } else if (target.kind == .deref) {
+            // p.* = val → store to the pointer held in the variable
+            const ptr_val = try self.emitExpr(target.lhs.?);
+            cot.memory.store(self.current_block, self.loc, val, ptr_val);
         }
-        // TODO: field/index assignment
     }
 
     fn emitCompoundAssign(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
@@ -374,8 +405,8 @@ pub const Codegen = struct {
         const rhs = try self.emitExpr(stmt.expr.?);
 
         if (target.kind == .ident) {
-            if (self.vars.get(target.name)) |addr| {
-                const cur = cot.memory.load(self.current_block, self.loc, addr, rhs.getType());
+            if (self.vars.get(target.name)) |info| {
+                const cur = cot.memory.load(self.current_block, self.loc, info.addr, info.ty);
                 const result = switch (stmt.op) {
                     .plus_equal => cot.arith.add(self.current_block, self.loc, cur, rhs),
                     .minus_equal => cot.arith.sub(self.current_block, self.loc, cur, rhs),
@@ -383,7 +414,7 @@ pub const Codegen = struct {
                     .slash_equal => cot.arith.div(self.current_block, self.loc, cur, rhs, true),
                     else => cur,
                 };
-                cot.memory.store(self.current_block, self.loc, result, addr);
+                cot.memory.store(self.current_block, self.loc, result, info.addr);
             }
         }
     }
@@ -440,13 +471,9 @@ pub const Codegen = struct {
     }
 
     fn emitIdent(self: *Codegen, expr: *const parser.Expr) Value {
-        if (self.vars.get(expr.name)) |addr| {
-            // Load from alloca
-            // We need to know the type — peek at what's stored
-            // For now, assume the addr is a pointer to the value
-            return cot.memory.load(self.current_block, self.loc, addr, self.ty_i32);
+        if (self.vars.get(expr.name)) |info| {
+            return cot.memory.load(self.current_block, self.loc, info.addr, info.ty);
         }
-        // Unknown identifier — return zero as placeholder
         return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
     }
 
@@ -497,7 +524,7 @@ pub const Codegen = struct {
             return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
         }
 
-        // Regular function call
+        // Build argument values
         var arg_vals: [32]Value = undefined;
         var n: usize = 0;
         if (expr.has_args) {
@@ -507,22 +534,58 @@ pub const Codegen = struct {
             }
         }
 
-        // Build func.call op
+        // Look up callee return type from the function's symbol
+        var ret_type = self.ty_i32;
+        var is_void = false;
+        const name_ref = c.MlirStringRef{ .data = expr.name.ptr, .length = expr.name.len };
+        const sym_table = c.mlirSymbolTableCreate(self.module.getOperation().raw);
+        defer c.mlirSymbolTableDestroy(sym_table);
+        const callee_op = c.mlirSymbolTableLookup(sym_table, name_ref);
+        if (!c.mlirOperationIsNull(callee_op)) {
+            const ft_attr = c.mlirOperationGetAttributeByName(
+                callee_op,
+                c.mlirStringRefCreateFromCString("function_type"),
+            );
+            if (!c.mlirAttributeIsNull(ft_attr)) {
+                const fty = c.mlirTypeAttrGetValue(ft_attr);
+                if (c.mlirFunctionTypeGetNumResults(fty) == 0) {
+                    is_void = true;
+                } else {
+                    ret_type = .{ .raw = c.mlirFunctionTypeGetResult(fty, 0) };
+                }
+            }
+        }
+
         var state = cot.ir.OperationState.get("func.call", self.loc);
         state.addOperands(arg_vals[0..n]);
-        // TODO: look up return type from function signature
-        state.addResults(&.{self.ty_i32}); // assume i32 return for now
+        if (!is_void) state.addResults(&.{ret_type});
         state.addAttribute(self.ctx, "callee", cot.ir.Attribute{
             .raw = c.mlirFlatSymbolRefAttrGet(self.ctx.raw, c.mlirStringRefCreateFromCString(self.zstr(expr.name))),
         });
         const op = state.create();
         self.current_block.appendOwnedOperation(op);
+
+        if (is_void) {
+            return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
+        }
         return Value{ .raw = c.mlirOperationGetResult(op.raw, 0) };
     }
 
     fn emitFieldAccess(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        _ = try self.emitExpr(expr.lhs.?);
-        // TODO: cir.field_val using expr.name as field name
+        const base = try self.emitExpr(expr.lhs.?);
+        const base_ty = base.getType();
+        // Look up field index by name in the struct def
+        if (cot.types.isStruct(base_ty)) {
+            const num_fields = cot.types.structNumFields(base_ty);
+            var idx: usize = 0;
+            while (idx < num_fields) : (idx += 1) {
+                const fname = cot.types.structFieldName(base_ty, idx);
+                if (std.mem.eql(u8, fname, expr.name)) {
+                    const field_ty = cot.types.structFieldType(base_ty, idx);
+                    return cot.structs.fieldVal(self.current_block, self.loc, field_ty, base, @intCast(idx));
+                }
+            }
+        }
         return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
     }
 
@@ -533,9 +596,34 @@ pub const Codegen = struct {
     }
 
     fn emitStructLit(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        _ = expr;
-        // TODO: cir.struct_init
-        return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
+        const sty = self.struct_types.get(expr.name) orelse
+            return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
+        const sd = self.struct_defs.get(expr.name) orelse
+            return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
+
+        // Build field values in struct declaration order
+        var field_vals: [32]Value = undefined;
+        const num_fields = sd.fields.items.len;
+        for (sd.fields.items, 0..) |field, fi| {
+            // Find matching field init by name
+            var found = false;
+            if (expr.has_fields) {
+                for (expr.fields.items) |finit| {
+                    if (std.mem.eql(u8, finit.name, field.name)) {
+                        field_vals[fi] = self.emitExpr(finit.value) catch
+                            cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                // Default to zero
+                field_vals[fi] = cot.arith.constant.int(self.current_block, self.loc,
+                    self.resolveType(field.type_ref), 0);
+            }
+        }
+        return cot.structs.init(self.current_block, self.loc, sty, field_vals[0..num_fields]);
     }
 
     fn emitArrayLit(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
@@ -545,18 +633,29 @@ pub const Codegen = struct {
     }
 
     fn emitAddrOf(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        // &x → address of variable
+        // &x → address of variable (the alloca IS the address)
         const inner = expr.lhs.?;
         if (inner.kind == .ident) {
-            if (self.vars.get(inner.name)) |addr| {
-                return addr; // alloca is already the address
+            if (self.vars.get(inner.name)) |info| {
+                return info.addr;
             }
         }
         return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
     }
 
     fn emitDeref(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
-        const ptr_val = try self.emitExpr(expr.lhs.?);
+        // p.* → load the pointer, then load through it
+        const inner = expr.lhs.?;
+        if (inner.kind == .ident) {
+            if (self.vars.get(inner.name)) |info| {
+                // Load the pointer value from the alloca
+                const ptr_val = cot.memory.load(self.current_block, self.loc, info.addr, info.ty);
+                // Load through the pointer — need to know the pointee type
+                // For now assume i32 (TODO: proper pointee type tracking)
+                return cot.memory.load(self.current_block, self.loc, ptr_val, self.ty_i32);
+            }
+        }
+        const ptr_val = try self.emitExpr(inner);
         return cot.memory.load(self.current_block, self.loc, ptr_val, self.ty_i32);
     }
 
@@ -574,8 +673,11 @@ pub const Codegen = struct {
 
     fn emitCastAs(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
         const input = try self.emitExpr(expr.lhs.?);
-        const target = self.resolveType(expr.cast_type);
-        // Use extsi/trunci/sitofp/fptosi based on types
+        // @intCast — use function return type as target
+        const target = if (std.mem.eql(u8, expr.cast_type.name, "__intcast"))
+            self.return_type
+        else
+            self.resolveType(expr.cast_type);
         const src_ty = input.getType();
         if (cot.types.isInteger(src_ty) and cot.types.isInteger(target)) {
             if (cot.types.integerWidth(src_ty) < cot.types.integerWidth(target))
@@ -653,15 +755,6 @@ pub const Codegen = struct {
     }
 
     fn appendBlockToFunc(self: *Codegen, block: Block) void {
-        // Get the current function's region and append the block.
-        // Walk up from module_body to find the func op.
-        const func_op = self.module_body.firstOperation();
-        if (func_op) |fop| {
-            // Find the last func op in the module — that's the current one.
-            var op = fop;
-            while (op.nextInBlock()) |next| op = next;
-            const region = op.getRegion(0);
-            region.appendOwnedBlock(block);
-        }
+        self.current_func_region.appendOwnedBlock(block);
     }
 };

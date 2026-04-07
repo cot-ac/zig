@@ -1,5 +1,5 @@
-fn main() i32 {
-    var x: i32 = 30;
-    var y: i32 = 12;
-    return x + y;
+pub fn main() u8 {
+    const x: i32 = 30;
+    const y: i32 = 12;
+    return @intCast(x + y);
 }

@@ -880,7 +880,29 @@ pub const Parser = struct {
             node.* = .{ .kind = .cast_as, .pos = pos, .lhs = operand, .cast_type = cast_type };
             return node;
         }
-        // Other builtins: treat as function call
+        // @intCast(expr) — truncation/extension cast to context type
+        if (std.mem.eql(u8, name, "@intCast")) {
+            self.expect(.l_paren);
+            const operand = try self.parseExpr();
+            self.expect(.r_paren);
+            const node = try self.alloc.create(Expr);
+            // cast_as with empty cast_type — codegen will use return type context
+            node.* = .{ .kind = .cast_as, .pos = pos, .lhs = operand, .cast_type = .{ .name = "__intcast" } };
+            return node;
+        }
+        // Other builtins: treat as function call with args
+        if (self.peek() == .l_paren) {
+            self.advance();
+            const node = try self.alloc.create(Expr);
+            node.* = .{ .kind = .call, .name = name, .pos = pos, .has_args = true };
+            node.args = std.ArrayListUnmanaged(*Expr){};
+            while (self.peek() != .r_paren) {
+                try node.args.append(self.alloc, try self.parseExpr());
+                if (self.peek() == .comma) self.advance();
+            }
+            self.expect(.r_paren);
+            return node;
+        }
         const node = try self.alloc.create(Expr);
         node.* = .{ .kind = .ident, .name = name, .pos = pos };
         return node;
