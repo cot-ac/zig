@@ -1,0 +1,12 @@
+.{
+    .fingerprint = 0x7f23a4e1d07f9b3c,
+    .name = .cot_zig,
+    .version = "0.1.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "lib",
+        "src",
+        "test",
+    },
+}
