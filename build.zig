@@ -53,6 +53,58 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(example);
 
+    // --- czig compiler ---
+    const compiler_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "cot", .module = cot_mod },
+            .{ .name = "scanner.zig", .module = b.createModule(.{
+                .root_source_file = b.path("src/scanner.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) },
+        },
+    });
+    const scanner_mod = b.createModule(.{
+        .root_source_file = b.path("src/scanner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const parser_mod = b.createModule(.{
+        .root_source_file = b.path("src/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_mod.addImport("scanner", scanner_mod);
+    const codegen_mod = b.createModule(.{
+        .root_source_file = b.path("src/codegen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    codegen_mod.addImport("cot", cot_mod);
+    codegen_mod.addImport("parser", parser_mod);
+    codegen_mod.addImport("scanner", scanner_mod);
+
+    const czig_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    czig_mod.addImport("cot", cot_mod);
+    czig_mod.addImport("scanner", scanner_mod);
+    czig_mod.addImport("parser", parser_mod);
+    czig_mod.addImport("codegen", codegen_mod);
+    linkCotLibraries(b, czig_mod, cot_dev_build, core_build, llvm_dir);
+    _ = compiler_mod;
+
+    const czig = b.addExecutable(.{
+        .name = "czig",
+        .root_module = czig_mod,
+    });
+    b.installArtifact(czig);
+
     // --- Sema test (Zig-written SemanticAnalysis) ---
     const sema_mod = b.createModule(.{
         .root_source_file = b.path("test/sema_test.zig"),
