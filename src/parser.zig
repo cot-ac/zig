@@ -28,6 +28,7 @@ pub const TypeRef = struct {
 pub const Param = struct {
     name: []const u8,
     type_ref: TypeRef,
+    is_comptime: bool = false,  // comptime T: type
 };
 
 pub const FieldInit = struct {
@@ -203,10 +204,17 @@ pub const Parser = struct {
 
         var params = std.ArrayListUnmanaged(Param){};
         while (self.peek() != .r_paren) {
+            // comptime T: type — Zig generic parameter
+            const is_comptime = self.peek() == .kw_comptime;
+            if (is_comptime) self.advance();
             const pname = self.expectIdent();
             self.expect(.colon);
             const ptype = try self.parseTypeRef();
-            try params.append(self.alloc,.{ .name = pname, .type_ref = ptype });
+            try params.append(self.alloc, .{
+                .name = pname,
+                .type_ref = ptype,
+                .is_comptime = is_comptime,
+            });
             if (self.peek() == .comma) self.advance();
         }
         self.expect(.r_paren);
@@ -884,6 +892,22 @@ pub const Parser = struct {
                 if (self.peek() == .l_brace) {
                     return self.parseStructLiteral(name, tok.start);
                 }
+                const node = try self.alloc.create(Expr);
+                node.* = .{ .kind = .ident, .name = name, .pos = tok.start };
+                return node;
+            },
+            // Type keywords as expressions (Zig: comptime type values)
+            .ty_i8, .ty_i16, .ty_i32, .ty_i64,
+            .ty_u8, .ty_u16, .ty_u32, .ty_u64, .ty_usize,
+            .ty_f32, .ty_f64, .ty_bool, .ty_void => {
+                self.advance();
+                const name = switch (kind) {
+                    .ty_i8 => "i8", .ty_i16 => "i16", .ty_i32 => "i32", .ty_i64 => "i64",
+                    .ty_u8 => "u8", .ty_u16 => "u16", .ty_u32 => "u32", .ty_u64 => "u64",
+                    .ty_usize => "usize",
+                    .ty_f32 => "f32", .ty_f64 => "f64", .ty_bool => "bool", .ty_void => "void",
+                    else => "i32",
+                };
                 const node = try self.alloc.create(Expr);
                 node.* = .{ .kind = .ident, .name = name, .pos = tok.start };
                 return node;

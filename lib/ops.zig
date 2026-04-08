@@ -52,6 +52,22 @@ pub const func = struct {
     pub fn isVoidReturn(module_op: Operation, name: [*:0]const u8) bool {
         return c.cirFuncIsVoidReturn(module_op.raw, name);
     }
+
+    /// Build a cir.generic_apply: call a generic function with type substitutions.
+    pub fn genericApply(
+        block: Block, loc: Location, callee: [*:0]const u8,
+        args: []const Value,
+        sub_keys: []const [*:0]const u8, sub_types: []const Type,
+        result_type: Type,
+    ) Value {
+        return .{ .raw = c.cirBuildGenericApply(
+            block.raw, loc.raw, callee,
+            @intCast(args.len), @ptrCast(args.ptr),
+            @intCast(sub_keys.len),
+            @ptrCast(sub_keys.ptr), @ptrCast(sub_types.ptr),
+            1, @ptrCast(&result_type),
+        ) };
+    }
 };
 
 // ===----------------------------------------------------------------------===

@@ -136,10 +136,10 @@ fn linkCotLibraries(
 ) void {
     // COT framework libraries
     const cot_libs = [_]struct { dir: []const u8, name: []const u8 }{
-        .{ .dir = "c-api", .name = "COTCApi" },
-        .{ .dir = "lib/Pipeline", .name = "COTPipeline" },
-        .{ .dir = "lib/Construct", .name = "COTConstruct" },
-        .{ .dir = "lib/CIR", .name = "CIR" },
+        .{ .dir = "cpp/c-api", .name = "COTCApi" },
+        .{ .dir = "cpp/lib/Pipeline", .name = "COTPipeline" },
+        .{ .dir = "cpp/lib/Construct", .name = "COTConstruct" },
+        .{ .dir = "cpp/lib/CIR", .name = "CIR" },
         .{ .dir = "runtime", .name = "cir_arc" },
     };
     for (cot_libs) |lib| {
@@ -149,20 +149,21 @@ fn linkCotLibraries(
     // Core construct libraries — force-load via linker flag to prevent
     // dead-stripping of static constructors used for construct registration.
     const constructs = [_]struct { dir: []const u8, name: []const u8 }{
-        .{ .dir = "arith/lib", .name = "CotArith" },
-        .{ .dir = "memory/lib", .name = "CotMemory" },
-        .{ .dir = "flow/lib", .name = "CotFlow" },
-        .{ .dir = "structs/lib", .name = "CotStructs" },
-        .{ .dir = "arrays/lib", .name = "CotArrays" },
-        .{ .dir = "slices/lib", .name = "CotSlices" },
-        .{ .dir = "optionals/lib", .name = "CotOptionals" },
-        .{ .dir = "errors/lib", .name = "CotErrors" },
-        .{ .dir = "test/lib", .name = "CotTest" },
-        .{ .dir = "enums/lib", .name = "CotEnums" },
-        .{ .dir = "unions/lib", .name = "CotUnions" },
-        .{ .dir = "generics/lib", .name = "CotGenerics" },
-        .{ .dir = "traits/lib", .name = "CotTraits" },
-        .{ .dir = "vwt/lib", .name = "CotVWT" },
+        .{ .dir = "arith/cpp", .name = "CotArith" },
+        .{ .dir = "memory/cpp", .name = "CotMemory" },
+        .{ .dir = "flow/cpp", .name = "CotFlow" },
+        .{ .dir = "structs/cpp", .name = "CotStructs" },
+        .{ .dir = "arrays/cpp", .name = "CotArrays" },
+        .{ .dir = "slices/cpp", .name = "CotSlices" },
+        .{ .dir = "optionals/cpp", .name = "CotOptionals" },
+        .{ .dir = "errors/cpp", .name = "CotErrors" },
+        .{ .dir = "test/cpp", .name = "CotTest" },
+        .{ .dir = "enums/cpp", .name = "CotEnums" },
+        .{ .dir = "unions/cpp", .name = "CotUnions" },
+        .{ .dir = "generics/cpp", .name = "CotGenerics" },
+        .{ .dir = "traits/cpp", .name = "CotTraits" },
+        .{ .dir = "vwt/cpp", .name = "CotVWT" },
+        .{ .dir = "comptime/cpp", .name = "CotComptime" },
     };
     for (constructs) |cn| {
         const path = b.pathJoin(&.{ core_build, cn.dir, b.fmt("lib{s}.a", .{cn.name}) });

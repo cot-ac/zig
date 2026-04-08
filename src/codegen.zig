@@ -56,6 +56,12 @@ pub const Codegen = struct {
     enum_types: std.StringHashMap(Type) = undefined,
     enum_defs: std.StringHashMap(parser.EnumDef) = undefined,
 
+    // Comptime type param map: "T" → !cir.type_param<"T"> (active during generic fn)
+    comptime_type_params: std.StringHashMap(Type) = undefined,
+
+    // Functions with comptime type params: fn_name → [param names]
+    generic_functions: std.StringHashMap([]const []const u8) = undefined,
+
     // Scratch buffer for func.call result types (avoids dangling slice)
     call_result_buf: [1]Type = undefined,
 
@@ -83,6 +89,8 @@ pub const Codegen = struct {
         gen.struct_defs = std.StringHashMap(parser.StructDef).init(alloc);
         gen.enum_types = std.StringHashMap(Type).init(alloc);
         gen.enum_defs = std.StringHashMap(parser.EnumDef).init(alloc);
+        gen.comptime_type_params = std.StringHashMap(Type).init(alloc);
+        gen.generic_functions = std.StringHashMap([]const []const u8).init(alloc);
         return gen;
     }
 
@@ -152,15 +160,36 @@ pub const Codegen = struct {
     // ===----------------------------------------------------------------------===
 
     fn emitFunction(self: *Codegen, fd: parser.FnDecl) CodegenError!void {
+        // Set up comptime type params: comptime T: type → !cir.type_param<"T">
+        self.comptime_type_params.clearRetainingCapacity();
+        var comptime_names: [8][]const u8 = undefined;
+        var comptime_count: usize = 0;
+        for (fd.params.items) |p| {
+            if (p.is_comptime and std.mem.eql(u8, p.type_ref.name, "type")) {
+                const tp_ty = cot.types.typeParamType(self.ctx, self.zstr(p.name));
+                try self.comptime_type_params.put(p.name, tp_ty);
+                comptime_names[comptime_count] = p.name;
+                comptime_count += 1;
+            }
+        }
+        // Record this function as generic if it has comptime type params
+        if (comptime_count > 0) {
+            const names = self.alloc.dupe([]const u8, comptime_names[0..comptime_count]) catch &.{};
+            try self.generic_functions.put(fd.name, names);
+        }
+
         const ret_type = self.resolveType(fd.return_type);
         self.return_type = ret_type;
 
-        // Build parameter types
+        // Build parameter types (skip comptime type params — they're not runtime)
         var param_types: [32]Type = undefined;
-        for (fd.params.items, 0..) |p, i| {
-            param_types[i] = self.resolveType(p.type_ref);
+        var n: usize = 0;
+        for (fd.params.items) |p| {
+            if (p.is_comptime and std.mem.eql(u8, p.type_ref.name, "type"))
+                continue; // comptime type param — not a runtime parameter
+            param_types[n] = self.resolveType(p.type_ref);
+            n += 1;
         }
-        const n = fd.params.items.len;
 
         const is_void_ret = std.mem.eql(u8, fd.return_type.name, "void");
         const result_types: []const Type = if (is_void_ret) &.{} else &.{ret_type};
@@ -188,9 +217,13 @@ pub const Codegen = struct {
         self.vars = std.StringHashMap(VarInfo).init(self.alloc);
 
         // Bind parameters: alloca + store for mutable access
-        for (fd.params.items, 0..) |p, i| {
-            const arg = entry_block.getArgument(i);
-            const addr = cot.memory.alloca(self.current_block, self.loc, param_types[i]);
+        // Skip comptime type params (they're not runtime block arguments)
+        var arg_idx: usize = 0;
+        for (fd.params.items) |p| {
+            if (p.is_comptime and std.mem.eql(u8, p.type_ref.name, "type"))
+                continue;
+            const arg = entry_block.getArgument(arg_idx);
+            const addr = cot.memory.alloca(self.current_block, self.loc, param_types[arg_idx]);
             cot.memory.store(self.current_block, self.loc, arg, addr);
             // Track pointee type for pointer params
             const pointee: ?Type = if (p.type_ref.is_pointer) blk: {
@@ -198,7 +231,8 @@ pub const Codegen = struct {
                 inner.is_pointer = false;
                 break :blk self.resolveType(inner);
             } else null;
-            try self.vars.put(p.name, .{ .addr = addr, .ty = param_types[i], .pointee_ty = pointee });
+            try self.vars.put(p.name, .{ .addr = addr, .ty = param_types[arg_idx], .pointee_ty = pointee });
+            arg_idx += 1;
         }
 
         // Emit body
@@ -714,6 +748,12 @@ pub const Codegen = struct {
             return cot.arith.constant.int(self.current_block, self.loc, self.ty_i32, 0);
         }
 
+        // Check if this is a generic function call: add(i32, 20, 22)
+        // If the callee has comptime type params, the first N args are types
+        if (self.generic_functions.get(expr.name)) |type_param_names| {
+            return self.emitGenericCall(expr, type_param_names);
+        }
+
         // Build argument values
         var arg_vals: [32]Value = undefined;
         var n: usize = 0;
@@ -1038,7 +1078,62 @@ pub const Codegen = struct {
         if (self.struct_types.get(ty.name)) |sty| return sty;
         if (self.enum_types.get(ty.name)) |ety| return ety;
 
+        // Comptime type params: T → !cir.type_param<"T">
+        if (self.comptime_type_params.get(ty.name)) |tp| return tp;
+
         return self.ty_i32; // fallback
+    }
+
+    /// Emit a generic function call: add(i32, 20, 22) → cir.generic_apply
+    fn emitGenericCall(self: *Codegen, expr: *const parser.Expr, type_param_names: []const []const u8) CodegenError!Value {
+        const num_type_args = type_param_names.len;
+
+        // First N args are type names → build substitution map
+        var sub_keys: [8][*:0]const u8 = undefined;
+        var sub_types: [8]Type = undefined;
+        for (0..num_type_args) |i| {
+            sub_keys[i] = self.zstr(type_param_names[i]);
+            // The arg at position i should be an ident naming a type
+            if (expr.has_args and i < expr.args.items.len) {
+                const type_arg = expr.args.items[i];
+                if (type_arg.kind == .ident) {
+                    sub_types[i] = self.resolveType(.{ .name = type_arg.name });
+                } else {
+                    sub_types[i] = self.ty_i32; // fallback
+                }
+            }
+        }
+
+        // Remaining args are values
+        var arg_vals: [32]Value = undefined;
+        var n: usize = 0;
+        if (expr.has_args) {
+            for (expr.args.items[num_type_args..]) |arg| {
+                arg_vals[n] = try self.emitExpr(arg, null);
+                n += 1;
+            }
+        }
+
+        // Look up callee return type — resolve type_param with our concrete types
+        const callee_name = self.zstr(expr.name);
+        const module_op = self.module.getOperation();
+        var result_type = self.ty_i32;
+        if (cot.func.lookupReturnType(module_op, callee_name)) |ret_ty| {
+            if (cot.types.isTypeParam(ret_ty)) {
+                // Return type is a type param — use the first substitution
+                result_type = sub_types[0];
+            } else {
+                result_type = ret_ty;
+            }
+        }
+
+        // Emit cir.generic_apply
+        const result = cot.ops.func.genericApply(
+            self.current_block, self.loc, callee_name,
+            arg_vals[0..n], sub_keys[0..num_type_args], sub_types[0..num_type_args],
+            result_type,
+        );
+        return result;
     }
 
     /// Coerce call arguments: &array → slice when callee expects []T.

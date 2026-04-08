@@ -89,7 +89,8 @@ pub fn main() !void {
     // Pipeline
     switch (mode) {
         .emit_cir => {
-            // Print CIR to stdout
+            // Print CIR to stderr (mlirOperationDump) — this is the standard
+            // MLIR pattern for cir-opt compatibility. Pipe with 2>&1 if needed.
             const module_op = gen.module.getOperation();
             @import("cot").c.cir.mlirOperationDump(module_op.raw);
         },

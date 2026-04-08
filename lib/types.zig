@@ -221,6 +221,17 @@ pub fn isTaggedUnion(ty: Type) bool {
 }
 
 // ===----------------------------------------------------------------------===
+// Generics types
+// ===----------------------------------------------------------------------===
+
+pub fn typeParamType(ctx: Context, name: [*:0]const u8) Type {
+    return .{ .raw = c.cirTypeParamTypeGet(ctx.raw, name) };
+}
+pub fn isTypeParam(ty: Type) bool {
+    return c.cirTypeIsTypeParam(ty.raw);
+}
+
+// ===----------------------------------------------------------------------===
 // Type introspection — widths, element types, function type queries
 // ===----------------------------------------------------------------------===
 
