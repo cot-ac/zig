@@ -467,7 +467,12 @@ pub const Codegen = struct {
 
     fn emitCompoundAssign(self: *Codegen, stmt: *const parser.Stmt) CodegenError!void {
         const target = stmt.lhs_expr orelse return;
-        const rhs = try self.emitExpr(stmt.expr.?, null);
+        // Pass target type so RHS integer literals get the right width
+        const target_type: ?Type = if (target.kind == .ident)
+            (if (self.vars.get(target.name)) |info| info.ty else null)
+        else
+            null;
+        const rhs = try self.emitExpr(stmt.expr.?, target_type);
 
         if (target.kind == .ident) {
             if (self.vars.get(target.name)) |info| {
@@ -719,9 +724,11 @@ pub const Codegen = struct {
             }
         }
 
-        // Look up callee return type via the C API
         const callee_name = self.zstr(expr.name);
         const module_op = self.module.getOperation();
+
+        // Coerce arguments: &array → slice at call sites (Zig semantics)
+        self.coerceCallArgs(module_op, expr, arg_vals[0..n]);
         const is_void = cot.func.isVoidReturn(module_op, callee_name);
         const result_types: []const Type = if (is_void) &.{} else blk: {
             const ret_type = cot.func.lookupReturnType(module_op, callee_name) orelse self.ty_i32;
@@ -743,7 +750,13 @@ pub const Codegen = struct {
     fn emitFieldAccess(self: *Codegen, expr: *const parser.Expr) CodegenError!Value {
         const base = try self.emitExpr(expr.lhs.?, null);
         const base_ty = base.getType();
-        // Look up field index by name in the struct def
+
+        // Slice .len → cir.slice_len
+        if (cot.types.isSlice(base_ty) and std.mem.eql(u8, expr.name, "len")) {
+            return cot.slices.len(self.current_block, self.loc, base);
+        }
+
+        // Struct field access
         if (cot.types.isStruct(base_ty)) {
             const num_fields = cot.types.structNumFields(base_ty);
             var idx: usize = 0;
@@ -1015,6 +1028,7 @@ pub const Codegen = struct {
         if (std.mem.eql(u8, ty.name, "u16")) return self.ty_i16;
         if (std.mem.eql(u8, ty.name, "u32")) return self.ty_i32;
         if (std.mem.eql(u8, ty.name, "u64")) return self.ty_i64;
+        if (std.mem.eql(u8, ty.name, "usize")) return self.ty_i64; // 64-bit target
         if (std.mem.eql(u8, ty.name, "f32")) return self.ty_f32;
         if (std.mem.eql(u8, ty.name, "f64")) return self.ty_f64;
         if (std.mem.eql(u8, ty.name, "bool")) return self.ty_bool;
@@ -1025,6 +1039,38 @@ pub const Codegen = struct {
         if (self.enum_types.get(ty.name)) |ety| return ety;
 
         return self.ty_i32; // fallback
+    }
+
+    /// Coerce call arguments: &array → slice when callee expects []T.
+    /// Zig passes &arr to []T params via implicit coercion.
+    fn coerceCallArgs(self: *Codegen, module_op: cot.ir.Operation, expr: *const parser.Expr, args: []Value) void {
+        const sym_table = cot.ir.SymbolTable.create(module_op);
+        defer sym_table.destroy();
+        const callee_op = sym_table.lookup(expr.name) orelse return;
+        const fty = callee_op.getFunctionType() orelse return;
+        const num_params = cot.types.functionNumInputs(fty);
+
+        for (0..@min(args.len, num_params)) |i| {
+            const param_ty = cot.types.functionInput(fty, i);
+            if (!cot.types.isSlice(param_ty) or !cot.types.isPtr(args[i].getType()))
+                continue;
+            // &arr passed to []T — coerce via array_to_slice
+            const arg_expr = expr.args.items[i];
+            if (arg_expr.kind != .addr_of) continue;
+            const inner = arg_expr.lhs orelse continue;
+            if (inner.kind != .ident) continue;
+            const info = self.vars.get(inner.name) orelse continue;
+            if (!cot.types.isArray(info.ty)) continue;
+
+            const elem_ty = cot.types.arrayElementType(info.ty);
+            const slice_ty = cot.types.sliceType(self.ctx, elem_ty);
+            const arr_val = cot.memory.load(self.current_block, self.loc, info.addr, info.ty);
+            const arr_addr = cot.memory.alloca(self.current_block, self.loc, info.ty);
+            cot.memory.store(self.current_block, self.loc, arr_val, arr_addr);
+            const zero = cot.arith.constant.int(self.current_block, self.loc, self.ty_i64, 0);
+            const len = cot.arith.constant.int(self.current_block, self.loc, self.ty_i64, cot.types.arraySize(info.ty));
+            args[i] = cot.slices.arrayToSlice(self.current_block, self.loc, slice_ty, arr_addr, zero, len);
+        }
     }
 
     fn appendBlockToFunc(self: *Codegen, block: Block) void {

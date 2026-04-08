@@ -322,12 +322,14 @@ pub const Parser = struct {
             return ty;
         }
 
-        // []T — slice
+        // []T or []const T — slice
         if (self.peek() == .l_bracket) {
             self.advance();
             if (self.peek() == .r_bracket) {
-                // []T — slice
+                // []T or []const T — slice
                 self.advance();
+                // Skip optional 'const' qualifier (Zig: []const i32)
+                if (self.peek() == .kw_const) self.advance();
                 ty = try self.parseTypeRef();
                 ty.is_slice = true;
                 return ty;
@@ -355,6 +357,7 @@ pub const Parser = struct {
             .ty_u16 => "u16",
             .ty_u32 => "u32",
             .ty_u64 => "u64",
+            .ty_usize => "usize",
             .ty_f32 => "f32",
             .ty_f64 => "f64",
             .ty_bool => "bool",
@@ -372,7 +375,7 @@ pub const Parser = struct {
             const next = self.peek();
             if (next == .ty_i8 or next == .ty_i16 or next == .ty_i32 or
                 next == .ty_i64 or next == .ty_u8 or next == .ty_u16 or
-                next == .ty_u32 or next == .ty_u64 or next == .ty_f32 or
+                next == .ty_u32 or next == .ty_u64 or next == .ty_usize or next == .ty_f32 or
                 next == .ty_f64 or next == .ty_bool or next == .ty_void or
                 next == .identifier)
             {

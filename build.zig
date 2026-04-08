@@ -160,6 +160,9 @@ fn linkCotLibraries(
         .{ .dir = "test/lib", .name = "CotTest" },
         .{ .dir = "enums/lib", .name = "CotEnums" },
         .{ .dir = "unions/lib", .name = "CotUnions" },
+        .{ .dir = "generics/lib", .name = "CotGenerics" },
+        .{ .dir = "traits/lib", .name = "CotTraits" },
+        .{ .dir = "vwt/lib", .name = "CotVWT" },
     };
     for (constructs) |cn| {
         const path = b.pathJoin(&.{ core_build, cn.dir, b.fmt("lib{s}.a", .{cn.name}) });
